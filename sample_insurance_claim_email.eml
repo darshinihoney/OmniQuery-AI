@@ -1,0 +1,48 @@
+From: Claims Department <claims@insuranceco.com>
+To: Policyholder <policyholder@example.com>
+Subject: Your Recent Insurance Claim - ID: INV789012
+
+MIME-Version: 1.0
+Content-Type: multipart/alternative; boundary="---boundary001"
+
+---boundary001
+Content-Type: text/plain; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+Dear Policyholder,
+
+Thank you for submitting your insurance claim with ID: INV789012. We have =
+received your application and it is currently under review.
+
+Our team will review your claim within 10 business days. You will receive =
+a notification once the review is complete, which may include a request =
+for additional documentation.
+
+Please note that per your policy, claims related to pre-existing conditions=
+ have a 90-day waiting period from the policy's inception date. All claims=
+ are subject to policy terms and conditions.
+
+For urgent inquiries, please reply to this email or call our helpline at =
++1-800-CLAIM-NOW (25246).
+
+Sincerely,
+The Claims Team
+InsuranceCo.
+
+---boundary001
+Content-Type: text/html; charset="utf-8"
+Content-Transfer-Encoding: quoted-printable
+
+<html>
+  <head></head>
+  <body>
+    <p>Dear Policyholder,</p>
+    <p>Thank you for submitting your insurance claim with ID: <b>INV789012</b>. We have received your application and it is currently under review.</p>
+    <p>Our team will review your claim within <b>10 business days</b>. You will receive a notification once the review is complete, which may include a request for additional documentation.</p>
+    <p>Please note that per your policy, claims related to pre-existing conditions have a <b>90-day waiting period</b> from the policy's inception date. All claims are subject to policy terms and conditions.</p>
+    <p>For any queries, please reply to this email or call our helpline at <a href=3D"mailto:support@example.com">support@example.com</a> or call us at <b>+1-800-123-4567</b>.</p>
+    <p>Sincerely,<br>The Claims Team<br><i>InsuranceCo.</i></p>
+  </body>
+</html>
+
+---boundary001--
