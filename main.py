@@ -155,6 +155,7 @@ import faiss
 import numpy as np
 import google.generativeai as genai
 from bs4 import BeautifulSoup
+import uvicorn
 
 # Initialize
 load_dotenv()
@@ -318,3 +319,6 @@ async def run_query(input_data: QueryInput, token: HTTPAuthorizationCredentials 
     except Exception as e:
         logger.exception("Run failure")
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
