@@ -266,6 +266,7 @@ def get_top_chunks(query: str, index, chunks, model, k=10):
     return [chunks[i] for i in I[0]]
 
 def answer_with_gemini(query: str, context: List[str]) -> str:
+    context_str = "\n\n".join(context)
     prompt = f"""
 You are a legal assistant designed to extract insurance policy clauses. Using the provided policy text, answer the user’s question **only from the context** and follow these instructions:
 
@@ -284,7 +285,7 @@ Now answer the following question:
 Question: {query}
 
 📄 Policy Context:
-{"\n\n".join(context)}
+{context_str}
 
 Respond concisely and clearly based only on the given context.
 """
