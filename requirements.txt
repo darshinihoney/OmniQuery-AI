@@ -11,3 +11,4 @@ google-generativeai
 python-dotenv
 pdfminer.six
 beautifulsoup4
+nltk
