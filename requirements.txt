@@ -1,14 +1,26 @@
+# fastapi
+# uvicorn
+# python-multipart
+# requests
+# PyMuPDF
+# docx2txt
+# faiss-cpu
+# numpy
+# sentence-transformers
+# google-generativeai
+# python-dotenv
+# pdfminer.six
+# beautifulsoup4
+# nltk
+
 fastapi
 uvicorn
-python-multipart
-requests
-PyMuPDF
-docx2txt
-faiss-cpu
+aiohttp
 numpy
-sentence-transformers
-google-generativeai
 python-dotenv
-pdfminer.six
-beautifulsoup4
-nltk
+sentence-transformers
+PyPDF2
+python-docx
+faiss-cpu
+google-generativeai
+pydantic

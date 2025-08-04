@@ -71,7 +71,7 @@
 import google.generativeai as genai
 
 # Replace with your actual API key
-genai.configure(api_key="AIzaSyBkxz2uLhf4jX2ZkujwDOULk8d82dr7sac")
+genai.configure(api_key="AIzaSyBpZtWn3pS97V8WCElJ8UhU7_1E8BqnS04")
 
 # List all available models
 models = genai.list_models()
