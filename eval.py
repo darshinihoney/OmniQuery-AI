@@ -69,15 +69,10 @@
 
 
 import google.generativeai as genai
+import os
 
-# Replace with your actual API key
 genai.configure(api_key="AIzaSyDAcCIvuG5vwZOE4tqlq7Veq-rtREGMpyY")
+model = genai.GenerativeModel("gemini-2.0-flash")
 
-# List all available models
-models = genai.list_models()
-
-# Print model name and its supported generation methods
-for model in models:
-    print(f"Model name: {model.name}")
-    print(f"Supported methods: {model.supported_generation_methods}")
-    print("-" * 40)
+response = model.generate_content("Say hello!")
+print(response.text)
