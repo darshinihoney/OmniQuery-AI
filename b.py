@@ -5,8 +5,6 @@ import email
 import re
 import numpy as np
 import asyncio
-import sys
-import random  # ✅ Added for sleep timing
 from typing import List, Tuple, Dict
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -21,26 +19,124 @@ from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 import hashlib
-import functools
 
+# Load environment variables
 load_dotenv()
 
-TEAM_AUTH_TOKEN = os.getenv("TEAM_AUTH_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
-
+# Configuration
 generation_config = genai.GenerationConfig(
-    temperature=0.1,
-    top_p=0.7,
-    top_k=15,
-    max_output_tokens=80,
+    temperature=0.2,
+    top_p=0.8,
+    top_k=20,
+    max_output_tokens=500,
     candidate_count=1
 )
 
-model = genai.GenerativeModel("gemini-2.0-flash", generation_config=generation_config)
+class GeminiAPIManager:
+    def __init__(self, keys: List[str]):
+        self.keys = [key for key in keys if key]
+        self.key_status = {
+            key: {
+                'minute_timestamps': [],
+                'daily_count': 0,
+                'last_reset_day': time.localtime().tm_yday,
+                'disabled': False,
+                'consecutive_slow': 0
+            } for key in self.keys
+        }
+        self.lock = threading.Lock()
+        self.models = {}
+        self.current_key_index = 0
+        self.response_time_threshold = 8
+        self.max_slow_responses = 3
+        
+        # Initialize models
+        for key in self.keys:
+            try:
+                genai.configure(api_key=key)
+                self.models[key] = genai.GenerativeModel(
+                    "gemini-1.5-flash",
+                    generation_config=generation_config
+                )
+            except Exception as e:
+                print(f"[ERROR] Failed to initialize Gemini model with key: {e}")
+                self.key_status[key]['disabled'] = True
+
+    def _reset_daily_counts_if_needed(self):
+        current_day = time.localtime().tm_yday
+        for key in self.keys:
+            if self.key_status[key]['last_reset_day'] != current_day:
+                self.key_status[key]['daily_count'] = 0
+                self.key_status[key]['last_reset_day'] = current_day
+                self.key_status[key]['disabled'] = False
+                self.key_status[key]['consecutive_slow'] = 0
+
+    def _prune_old_requests(self, timestamps: List[float]):
+        one_minute_ago = time.time() - 60
+        return [t for t in timestamps if t > one_minute_ago]
+
+    def _get_available_key(self):
+        self._reset_daily_counts_if_needed()
+        
+        for _ in range(len(self.keys)):
+            key = self.keys[self.current_key_index]
+            status = self.key_status[key]
+            
+            if status['disabled']:
+                self.current_key_index = (self.current_key_index + 1) % len(self.keys)
+                continue
+                
+            if status['daily_count'] >= 450:
+                status['disabled'] = True
+                self.current_key_index = (self.current_key_index + 1) % len(self.keys)
+                continue
+                
+            status['minute_timestamps'] = self._prune_old_requests(status['minute_timestamps'])
+            if len(status['minute_timestamps']) >= 12:
+                self.current_key_index = (self.current_key_index + 1) % len(self.keys)
+                continue
+                
+            return key
+            
+        raise Exception("No available API keys")
+
+    def get_model(self):
+        with self.lock:
+            key = self._get_available_key()
+            self.key_status[key]['minute_timestamps'].append(time.time())
+            self.key_status[key]['daily_count'] += 1
+            return self.models[key]
+
+    def record_response_time(self, key: str, response_time: float):
+        with self.lock:
+            if response_time > self.response_time_threshold:
+                self.key_status[key]['consecutive_slow'] += 1
+                if self.key_status[key]['consecutive_slow'] >= self.max_slow_responses:
+                    print(f"[WARNING] Switching from key {key[-4:]} due to slow responses")
+                    self.key_status[key]['disabled'] = True
+            else:
+                self.key_status[key]['consecutive_slow'] = 0
+
+TEAM_AUTH_TOKEN = os.getenv("TEAM_AUTH_TOKEN")
+GEMINI_KEYS = [os.getenv("GEMINI_API_KEY_1"), os.getenv("GEMINI_API_KEY_2")]
+gemini_manager = GeminiAPIManager(GEMINI_KEYS)
 
 app = FastAPI()
 security = HTTPBearer()
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Verify the provided authentication token"""
+    if not TEAM_AUTH_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="Server authentication not configured"
+        )
+    
+    if credentials.credentials != TEAM_AUTH_TOKEN:
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid authentication token"
+        )
 
 class HackRxRequest(BaseModel):
     documents: str
@@ -49,199 +145,194 @@ class HackRxRequest(BaseModel):
 class HackRxResponse(BaseModel):
     answers: List[str]
 
-embedding_model = None
-embedding_lock = threading.Lock()
-
-def get_embedding_model():
-    global embedding_model
-    if embedding_model is None:
-        with embedding_lock:
-            if embedding_model is None:
-                embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return embedding_model
-
-@app.on_event("startup")
-async def startup_event():
-    _ = get_embedding_model()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    if credentials.credentials != TEAM_AUTH_TOKEN:
-        raise HTTPException(status_code=403, detail="Invalid token")
+# Pre-load models at startup
+embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+dummy_embeddings = np.zeros((1, 384), dtype='float32')
+faiss_index = faiss.IndexFlatIP(384)
+faiss_index.add(dummy_embeddings)
 
 class FastDocumentProcessor:
     @staticmethod
-    def extract_text_from_pdf(path: str) -> Tuple[List[str], str]:
+    def extract_text(path: str, content_type: str) -> Tuple[List[str], str]:
+        try:
+            if "pdf" in content_type:
+                return FastDocumentProcessor._extract_pdf(path)
+            elif "word" in content_type or "docx" in content_type:
+                return FastDocumentProcessor._extract_docx(path)
+            elif "eml" in content_type or "message" in content_type:
+                return FastDocumentProcessor._extract_email(path)
+            return [], ""
+        except Exception as e:
+            print(f"[ERROR] Extraction failed: {e}")
+            return [], ""
+
+    @staticmethod
+    def _extract_pdf(path: str) -> Tuple[List[str], str]:
         reader = PdfReader(path)
         full_text = ""
         for page in reader.pages:
             text = page.extract_text()
             if text and len(text.strip()) > 15:
-                text = re.sub(r'\s+', ' ', text).strip()
-                full_text += f" {text}"
-        chunks = FastDocumentProcessor.smart_chunk(full_text, 400, 100)
-        return chunks, full_text.strip()
+                full_text += " " + re.sub(r'\s+', ' ', text).strip()
+        return FastDocumentProcessor._chunk_text(full_text), full_text
 
     @staticmethod
-    def extract_text_from_docx(path: str) -> Tuple[List[str], str]:
+    def _extract_docx(path: str) -> Tuple[List[str], str]:
         doc = DocxDocument(path)
-        paragraphs_text = []
-        for para in doc.paragraphs:
-            text = para.text.strip()
-            if text and len(text) > 15:
-                paragraphs_text.append(re.sub(r'\s+', ' ', text).strip())
-        full_text = " ".join(paragraphs_text)
-        chunks = FastDocumentProcessor.smart_chunk(full_text, 400, 100)
-        return chunks, full_text.strip()
+        full_text = " ".join(
+            para.text.strip() for para in doc.paragraphs 
+            if para.text.strip() and len(para.text.strip()) > 15
+        )
+        return FastDocumentProcessor._chunk_text(full_text), full_text
 
     @staticmethod
-    def extract_text_from_email(path: str) -> Tuple[List[str], str]:
+    def _extract_email(path: str) -> Tuple[List[str], str]:
         with open(path, 'r', encoding='utf-8', errors='ignore') as f:
             msg = email.message_from_file(f)
-            payload = msg.get_payload()
-            if isinstance(payload, list):
-                decoded_parts = []
-                for part in payload:
-                    if part.get_content_type() == 'text/plain':
-                        body = part.get_payload(decode=True)
-                        if body:
-                            decoded_parts.append(body.decode('utf-8', errors='ignore'))
-                body = "\n".join(decoded_parts) if decoded_parts else ""
-            else:
-                body = payload if isinstance(payload, str) else str(payload)
-        lines = [line.strip() for line in body.splitlines() if line.strip() and len(line.strip()) > 10 and not line.startswith('>')]
+            body = msg.get_payload()
+            if isinstance(body, list):
+                body = body[0].get_payload(decode=True)
+                body = body.decode('utf-8', errors='ignore') if body else ""
+            elif not isinstance(body, str):
+                body = str(body)
+        lines = [line.strip() for line in body.splitlines() 
+                if line.strip() and len(line.strip()) > 10 and not line.startswith('>')]
         full_text = " ".join(lines)
-        chunks = FastDocumentProcessor.smart_chunk(full_text, 400, 100)
-        return chunks, full_text
+        return FastDocumentProcessor._chunk_text(full_text), full_text
 
     @staticmethod
-    def smart_chunk(text: str, chunk_size: int, overlap: int) -> List[str]:
+    def _chunk_text(text: str, chunk_size: int = 350, overlap: int = 50) -> List[str]:
         if not text:
             return []
-        sentence_splitter = re.compile(r'(?<=[.!?])\s+')
-        sentences = sentence_splitter.split(text)
+        sentences = re.split(r'(?<=[.!?])\s+', text)
         chunks = []
         current_chunk = ""
         for sentence in sentences:
-            if len(current_chunk) + len(sentence) + (1 if current_chunk else 0) <= chunk_size:
+            if len(current_chunk) + len(sentence) + 1 <= chunk_size:
                 current_chunk += (" " + sentence) if current_chunk else sentence
             else:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
-                    if len(current_chunk) > overlap:
-                        current_chunk = current_chunk[len(current_chunk) - overlap:] + " " + sentence
-                    else:
-                        current_chunk = sentence
-                else:
-                    current_chunk = sentence
+                    current_chunk = current_chunk[-overlap:] + " " + sentence if len(current_chunk) > overlap else sentence
         if current_chunk:
             chunks.append(current_chunk.strip())
         return [c for c in chunks if len(c.strip()) > 30]
 
 class FastRetriever:
     def __init__(self):
-        self.model = get_embedding_model()
+        self.model = embedding_model
         self.text_chunks = []
-        self.full_text = ""
-        self.semantic_index = None
+        self.semantic_index = faiss_index
         self.keyword_map = {}
 
-    def build_indices(self, chunks: List[str], full_text: str):
+    def build_indices(self, chunks: List[str]):
         self.text_chunks = chunks
-        self.full_text = full_text
-        embeddings = self.model.encode(chunks, convert_to_numpy=True, show_progress_bar=False, batch_size=64, normalize_embeddings=True)
-        if embeddings.shape[0] == 0:
-            self.semantic_index = None
-            self.keyword_map = {}
-            return
-        self.semantic_index = faiss.IndexFlatIP(embeddings.shape[1])
-        self.semantic_index.add(embeddings.astype("float32"))
-        self._build_fast_keyword_map()
+        if chunks:
+            embeddings = self.model.encode(chunks, convert_to_numpy=True, batch_size=64, normalize_embeddings=True)
+            self.semantic_index = faiss.IndexFlatIP(embeddings.shape[1])
+            self.semantic_index.add(embeddings.astype("float32"))
+            self._build_keyword_map()
 
-    def _build_fast_keyword_map(self):
-        self.keyword_map = {}
-        insurance_keywords = ['free look', 'grace period', 'waiting period', 'premium', 'benefit', 'claim', 'policy', 'maternity', 'hospitalization']
+    def _build_keyword_map(self):
+        keywords = ['period', 'cover', 'benefit', 'claim', 'policy', 'hospital', 'waiting', 'premium']
         for i, chunk in enumerate(self.text_chunks):
             chunk_lower = chunk.lower()
-            for keyword in insurance_keywords:
+            for keyword in keywords:
                 if keyword in chunk_lower:
-                    self.keyword_map.setdefault(keyword, []).append(i)
+                    if keyword not in self.keyword_map:
+                        self.keyword_map[keyword] = []
+                    self.keyword_map[keyword].append(i)
 
-    def fast_search(self, question: str, top_k: int = 3) -> List[str]:
-        combined_results = []
-        if self.semantic_index and len(self.text_chunks) > 0:
+    def retrieve(self, question: str, top_k: int = 2) -> List[str]:
+        results = []
+        
+        # Semantic search
+        if self.semantic_index and self.text_chunks:
             q_vec = self.model.encode([question], convert_to_numpy=True, normalize_embeddings=True)
-            similarities, indices = self.semantic_index.search(q_vec.astype("float32"), min(top_k * 2, len(self.text_chunks)))
-            semantic_results = [self.text_chunks[idx] for idx, sim in zip(indices[0], similarities[0]) if sim > 0.15]
-            combined_results.extend(semantic_results)
+            similarities, indices = self.semantic_index.search(q_vec.astype("float32"), min(top_k, len(self.text_chunks)))
+            results.extend(self.text_chunks[idx] for idx, sim in zip(indices[0], similarities[0]) if sim > 0.2)
+        
+        # Keyword boost
         question_lower = question.lower()
         for keyword, chunk_indices in self.keyword_map.items():
             if keyword in question_lower:
-                for idx in chunk_indices[:2]:
-                    if idx < len(self.text_chunks) and self.text_chunks[idx] not in combined_results:
-                        combined_results.append(self.text_chunks[idx])
-        return list(dict.fromkeys(combined_results))[:top_k]
+                results.extend(self.text_chunks[idx] for idx in chunk_indices[:1] if idx < len(self.text_chunks))
+        
+        return list(dict.fromkeys(results))[:top_k]
 
 class OptimizedRAGPipeline:
     def __init__(self):
         self.retriever = FastRetriever()
-        self.contexts = []
-        self.full_document = ""
-        self.executor = ThreadPoolExecutor(max_workers=4)
         self.cache = {}
+        self.executor = ThreadPoolExecutor(max_workers=8)
+        self.semaphore = asyncio.Semaphore(4)
 
-    @functools.lru_cache(maxsize=128)
-    async def fetch_document_cached(self, url: str) -> Tuple[bytes, str]:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                content = await resp.read()
-                content_type = resp.headers.get("Content-Type", "").lower()
-                return content, content_type
-
-    async def process_documents(self, url: str) -> bool:
-        doc_hash = hashlib.sha256(url.encode()).hexdigest()
-        if doc_hash in self.cache:
-            self.contexts, self.full_document = self.cache[doc_hash]
-            await asyncio.get_event_loop().run_in_executor(self.executor, self.retriever.build_indices, self.contexts, self.full_document)
-            return True
+    async def process_document(self, url: str) -> bool:
         try:
-            content, content_type = await self.fetch_document_cached(url)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                path = os.path.join(tmpdir, "document")
-                with open(path, 'wb') as tmp_file:
-                    tmp_file.write(content)
-                loop = asyncio.get_event_loop()
-                chunks, full_text = [], ""
-                if "pdf" in content_type:
-                    chunks, full_text = await loop.run_in_executor(self.executor, FastDocumentProcessor.extract_text_from_pdf, path)
-                elif "word" in content_type or "docx" in content_type:
-                    chunks, full_text = await loop.run_in_executor(self.executor, FastDocumentProcessor.extract_text_from_docx, path)
-                elif "eml" in content_type or "message" in content_type:
-                    chunks, full_text = await loop.run_in_executor(self.executor, FastDocumentProcessor.extract_text_from_email, path)
-                else:
-                    return False
-                if not chunks or not full_text:
-                    return False
-                self.contexts = chunks
-                self.full_document = full_text
-                await loop.run_in_executor(self.executor, self.retriever.build_indices, chunks, full_text)
-                self.cache[doc_hash] = (chunks, full_text)
+            # Cache check
+            doc_hash = hashlib.sha256(url.encode()).hexdigest()
+            if doc_hash in self.cache:
+                self.retriever.build_indices(self.cache[doc_hash])
                 return True
+
+            # Fetch document
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        return False
+                    content = await resp.read()
+                    content_type = resp.headers.get("Content-Type", "").lower()
+
+            # Save to temp file
+            with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                tmp.write(content)
+                tmp_path = tmp.name
+
+            # Process in thread
+            loop = asyncio.get_event_loop()
+            chunks, _ = await loop.run_in_executor(
+                self.executor,
+                lambda: FastDocumentProcessor.extract_text(tmp_path, content_type)
+            )
+            os.unlink(tmp_path)
+
+            if not chunks:
+                return False
+
+            # Cache and build index
+            self.cache[doc_hash] = chunks
+            await loop.run_in_executor(self.executor, self.retriever.build_indices, chunks)
+            return True
+
         except Exception as e:
-            print(f"[ERROR] Document processing failed for {url}: {e}")
+            print(f"[ERROR] Document processing failed: {e}")
             return False
 
-    async def answer_questions(self, questions: List[str]) -> List[str]:
-        generate_content_partial = functools.partial(model.generate_content)
+    async def generate_answer(self, question: str) -> str:
+        try:
+            # Fast path for simple questions
+            if len(question) < 15 or question.lower().startswith(('hi', 'hello')):
+                return "Please ask a specific question about the insurance policy document."
 
-        async def answer_single_question(question: str) -> str:
+            # Retrieve context with timeout
             try:
-                relevant_chunks = self.retriever.fast_search(question, top_k=3)
-                if not relevant_chunks:
-                    return "I could not find relevant information in the document to answer this question."
-                context_str = "\n\n".join([f"Section {i+1}: {chunk}" for i, chunk in enumerate(relevant_chunks)])
-                prompt = f"""You are an insurance policy expert. Analyze the provided policy sections and answer the question with clear reasoning.
-CRITICAL INSTRUCTIONS:
+                relevant_chunks = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        self.executor,
+                        lambda: self.retriever.retrieve(question)
+                    ),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                relevant_chunks = []
+
+            if not relevant_chunks:
+                return self._get_fallback_answer(question)
+
+            # Build grounded prompt
+            context_str = "\n---\n".join(relevant_chunks)
+            prompt = f"""You are an insurance policy expert. Analyze the provided policy sections and answer the question with clear reasoning.
+            CRITICAL INSTRUCTIONS:
 1. CAREFULLY examine ALL provided context sections
 2. Look for ANY mention of the requested information, even if worded differently
 3. For questions about periods (like "free look period"), search for terms like: days, period, cooling off, grace period, cancellation period, etc.
@@ -256,53 +347,99 @@ CRITICAL INSTRUCTIONS:
 12. Keep response under 250 words
 13. If information is missing, state what you found instead.
 14. Be specific about numbers, timeframes, conditions, and procedures when found
-               
-POLICY SECTIONS:
+
+CONTEXT:
 {context_str}
 
 QUESTION: {question}
 
-Provide a reasoned answer explaining what the policy states and why:"""
+INSTRUCTIONS:
+1. Answer ONLY using the provided context
+2. Be specific about numbers, time periods, and conditions
+3. If unsure, say "The policy states..." instead of guessing
+4. Keep response under 150 words
+5. Reference exact context details when possible
 
-                response = await asyncio.get_event_loop().run_in_executor(self.executor, generate_content_partial, prompt)
+ANSWER:"""
+            
+            # Generate with strict timeout
+            model = gemini_manager.get_model()
+            start_time = time.time()
+            try:
+                response = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        self.executor,
+                        lambda: model.generate_content(prompt)
+                    ),
+                    timeout=6.0
+                )
+                response_time = time.time() - start_time
+                gemini_manager.record_response_time(model._client.api_key, response_time)
+                
+                if response and response.text:
+                    return response.text.strip()[:400]
+                return "No response generated"
+            except asyncio.TimeoutError:
+                return "Response timeout - please try again"
 
-                # ✅ Add 1 to 1.5 seconds delay
-                await asyncio.sleep(random.uniform(1.0, 1.5))
+        except Exception as e:
+            print(f"[ERROR] Generation failed: {e}")
+            return "Error processing question"
 
-                if response is None or not hasattr(response, "text") or not response.text.strip():
-                    return "Model returned no valid response."
-                return response.text.strip()
-            except Exception as e:
-                return f"I encountered an error while processing this question: {e}"
+    def _get_fallback_answer(self, question: str) -> str:
+        """Provide reasonable fallback when no context is found"""
+        q_lower = question.lower()
+        if any(t in q_lower for t in ['period', 'day', 'time']):
+            return "The policy typically specifies time periods for claims and coverage, but exact details weren't found in this document."
+        elif any(t in q_lower for t in ['cover', 'benefit', 'include']):
+            return "The document mentions various coverage benefits, but specific details for this question weren't found."
+        return "The policy document doesn't contain specific information about this question."
 
-        semaphore = asyncio.Semaphore(3)
+pipeline = OptimizedRAGPipeline()
 
-        async def bounded_answer(q):
-            async with semaphore:
-                return await answer_single_question(q)
-
-        tasks = [bounded_answer(q) for q in questions]
-        answers = await asyncio.gather(*tasks)
-        return answers
-
-engine = OptimizedRAGPipeline()
-
-@app.post("/hackrx/run", response_model=HackRxResponse)
+@app.post("/api/v1/hackrx/run", response_model=HackRxResponse)
 async def run_query(req: HackRxRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
-    start_time = time.time()
     verify_token(credentials)
-    print(f"\n[DEBUG] Received request with document URL: {req.documents}")
-    processing_success = await engine.process_documents(req.documents)
-    if not processing_success:
-        raise HTTPException(status_code=400, detail="Failed to process documents")
-    answers = await engine.answer_questions(req.questions)
-    print(f"[DEBUG] Completed in {time.time() - start_time:.2f} seconds")
-    return HackRxResponse(answers=answers)
+    
+    # Validate input
+    if not req.questions or len(req.questions) > 5:
+        raise HTTPException(status_code=400, detail="Provide 1-5 questions")
+    
+    # Process document and questions in parallel
+    doc_task = asyncio.create_task(pipeline.process_document(req.documents))
+    answer_tasks = [pipeline.generate_answer(q) for q in req.questions]
+    
+    # Wait for document processing with timeout
+    try:
+        await asyncio.wait_for(doc_task, timeout=3.0)
+    except asyncio.TimeoutError:
+        pass  # Continue with whatever context we have
+    
+    # Get answers with overall timeout
+    try:
+        answers = await asyncio.wait_for(asyncio.gather(*answer_tasks), timeout=8.0)
+        return HackRxResponse(answers=answers)
+    except asyncio.TimeoutError:
+        # Return whatever answers we have
+        done, _ = await asyncio.wait(answer_tasks, timeout=0)
+        answers = [t.result() if t.done() else "Processing timeout" for t in answer_tasks]
+        return HackRxResponse(answers=answers)
 
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
-        "embedding_model_loaded": embedding_model is not None,
-        "chunks_loaded": len(engine.contexts) if engine.contexts else 0
+        "cache_size": len(pipeline.cache),
+        "gemini_keys_available": sum(1 for k in GEMINI_KEYS if k)
     }
+
+@app.on_event("startup")
+async def startup():
+    # Warm up models
+    embedding_model.encode(["warmup"])
+    try:
+        model = gemini_manager.get_model()
+        model.generate_content("warmup")
+    except:
+        pass
+    print("Service ready - models warmed up")
