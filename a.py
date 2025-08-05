@@ -272,11 +272,10 @@ Provide a reasoned answer explaining what the policy states and why:"""
 
 engine = OptimizedRAGPipeline()
 
-@app.post("/hackrx/run", response_model=HackRxResponse)
+@app.post("/api/v1/hackrx/run", response_model=HackRxResponse)
 async def run_query(req: HackRxRequest, credentials: HTTPAuthorizationCredentials = Depends(security)):
     start_time = time.time()
     verify_token(credentials)
-    
     # Print the incoming request details
     print("\n" + "="*80)
     print(f"[DEBUG] Received new request with document URL: {req.documents}")
