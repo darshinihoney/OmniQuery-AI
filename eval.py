@@ -68,11 +68,3 @@
 # print(f"\n\n🔍 Semantic Accuracy: {accuracy:.2f}%")
 
 
-import google.generativeai as genai
-import os
-
-genai.configure(api_key="AIzaSyDAcCIvuG5vwZOE4tqlq7Veq-rtREGMpyY")
-model = genai.GenerativeModel("gemini-2.0-flash")
-
-response = model.generate_content("Say hello!")
-print(response.text)
