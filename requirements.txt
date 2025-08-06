@@ -15,5 +15,5 @@ python-docx
 faiss-cpu
 google-generativeai
 pydantic
-
+groq
 
